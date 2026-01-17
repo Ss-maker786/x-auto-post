@@ -3,7 +3,9 @@ name: X Auto Post
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 23 * * *"  # JST 08:00
+  - cron: "0 23 * * *"  # JST 08:00
+  - cron: "0 3  * * *"  # JST 12:00
+  - cron: "0 11 * * *"  # JST 20:00
 
 permissions:
   contents: write
