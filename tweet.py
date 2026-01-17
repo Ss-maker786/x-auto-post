@@ -33,7 +33,7 @@ def pick_next(rows):
     return None
 
 def post_to_x(text):
-    url = "https://api.x.com/2/tweets"
+    url = "https://api.twitter.com/2/tweets"
     auth = OAuth1(
         os.environ["X_API_KEY"],
         os.environ["X_API_SECRET"],
