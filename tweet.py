@@ -10,9 +10,12 @@ from requests_oauthlib import OAuth1
 CSV_PATH = "posts.csv"
 JST = tz.gettz("Asia/Tokyo")
 
-# リトライ設定（必要なら調整）
+# Retry settings
 MAX_RETRIES = 5
-BASE_SLEEP_SEC = 5  # exponential backoff の基準
+BASE_SLEEP_SEC = 5
+MAX_SLEEP_SEC = 120
+
+RETRY_STATUS = {502, 503, 504, 429}
 
 
 def now_jst():
@@ -44,8 +47,7 @@ def pick_next(rows):
     return None
 
 
-def _auth():
-    # env未設定が分かりやすいように KeyError をそのまま出す（設定ミスは落とす）
+def make_auth():
     return OAuth1(
         os.environ["X_API_KEY"],
         os.environ["X_API_SECRET"],
@@ -54,68 +56,83 @@ def _auth():
     )
 
 
-def post_to_x(text: str):
-    """
-    X API に投稿。503/429/一時ネットワークはリトライ。
-    成功したら tweet_id を返す。復旧しない場合は例外。
-    """
+def calc_wait_seconds(resp: requests.Response | None, attempt: int) -> int:
+    # Exponential backoff, capped
+    wait = BASE_SLEEP_SEC * (2 ** (attempt - 1))
+
+    # If rate-limited, respect reset header if present
+    if resp is not None and resp.status_code == 429:
+        reset = resp.headers.get("x-rate-limit-reset")
+        if reset and reset.isdigit():
+            wait = max(1, int(reset) - int(time.time()))
+
+    return min(wait, MAX_SLEEP_SEC)
+
+
+def post_to_x(text: str) -> str:
     url = "https://api.twitter.com/2/tweets"
-    auth = _auth()
+    auth = make_auth()
+
+    last_err = None
 
     for attempt in range(1, MAX_RETRIES + 1):
+        resp = None
         try:
-            r = requests.post(url, json={"text": text}, auth=auth, timeout=30)
+            resp = requests.post(url, json={"text": text}, auth=auth, timeout=30)
 
-            # 返ってきた内容をログに残す（失敗時の原因究明が楽）
-            if r.status_code >= 400:
-                body = r.text[:500]  # 長すぎるとログが汚れるので上限
-                print(f"HTTP {r.status_code} from X. body(head): {body}")
+            if resp.status_code in RETRY_STATUS:
+                body_head = (resp.text or "")[:500]
+                print(f"[warn] Retryable HTTP {resp.status_code}. body(head)={body_head}")
 
-            # リトライ対象
-            if r.status_code in (503, 502, 504, 429):
                 if attempt < MAX_RETRIES:
-                    # 429 は可能なら reset を読む（無ければ指数バックオフ）
-                    if r.status_code == 429:
-                        reset = r.headers.get("x-rate-limit-reset")
-                        if reset and reset.isdigit():
-                            wait = max(1, int(reset) - int(time.time()))
-                        else:
-                            wait = BASE_SLEEP_SEC * (2 ** (attempt - 1))
-                    else:
-                        wait = BASE_SLEEP_SEC * (2 ** (attempt - 1))
-
-                    wait = min(wait, 120)  # 上限（待ちすぎ防止）
-                    print(f"Retryable error {r.status_code}. retry {attempt}/{MAX_RETRIES} after {wait}s")
+                    wait = calc_wait_seconds(resp, attempt)
+                    print(f"[info] retry {attempt}/{MAX_RETRIES} after {wait}s")
                     time.sleep(wait)
                     continue
 
-            # それ以外は通常処理（ここで4xxなどは raise）
-            r.raise_for_status()
+            # Non-retryable or retries exhausted -> raise if error
+            if resp.status_code >= 400:
+                body_head = (resp.text or "")[:500]
+                print(f"[error] HTTP {resp.status_code}. body(head)={body_head}")
+            resp.raise_for_status()
 
-            data = r.json()
+            data = resp.json()
             return data["data"]["id"]
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            # 一時的なネットワーク系もリトライ
+            last_err = e
+            print(f"[warn] Network error: {type(e).__name__}: {e}")
+
             if attempt < MAX_RETRIES:
-                wait = min(BASE_SLEEP_SEC * (2 ** (attempt - 1)), 120)
-                print(f"Network error: {type(e).__name__}. retry {attempt}/{MAX_RETRIES} after {wait}s")
+                wait = min(BASE_SLEEP_SEC * (2 ** (attempt - 1)), MAX_SLEEP_SEC)
+                print(f"[info] retry {attempt}/{MAX_RETRIES} after {wait}s")
                 time.sleep(wait)
                 continue
             raise
 
-    # ここには通常来ない（念のため）
-    raise RuntimeError("Failed to post after retries.")
+        except Exception as e:
+            last_err = e
+            raise
+
+    # Should not reach here
+    raise RuntimeError(f"Failed to post after retries. last_err={last_err!r}")
 
 
 def main():
     rows = load_rows()
     target = pick_next(rows)
-    if not target:
-        print("No queued posts.")
-        return
 
-    tweet_id = post_to_x(target["text"])
+    if not target:
+        print("[info] No queued posts.")
+        return  # exit 0
+
+    try:
+        tweet_id = post_to_x(target["text"])
+    except Exception as e:
+        # A案：失敗でも緑にする（queuedのまま残す）
+        print(f"[warn] Post failed; keep queued. reason={type(e).__name__}: {e}")
+        return  # exit 0
+
     now = now_jst().strftime("%Y-%m-%d %H:%M")
 
     for r in rows:
@@ -123,9 +140,10 @@ def main():
             r["status"] = "posted"
             r["tweet_id"] = tweet_id
             r["posted_at_jst"] = now
+            break
 
     save_rows(rows, rows[0].keys())
-    print(f"Posted: {tweet_id}")
+    print(f"[info] Posted: {tweet_id}")
 
 
 if __name__ == "__main__":
